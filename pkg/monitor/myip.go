@@ -1,83 +1,104 @@
 package monitor
 
 import (
-	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/nezhahq/agent/pkg/logger"
 	"github.com/nezhahq/agent/pkg/util"
+	pb "github.com/nezhahq/agent/proto"
 )
 
-const MacOSChromeUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36"
+var (
+	cfList = []string{
+		"https://blog.cloudflare.com/cdn-cgi/trace",
+		"https://developers.cloudflare.com/cdn-cgi/trace",
+		"https://hostinger.com/cdn-cgi/trace",
+		"https://ahrefs.com/cdn-cgi/trace",
+	}
+	CustomEndpoints               []string
+	GeoQueryIP, CachedCountryCode string
+	GeoQueryIPChanged             bool = true
+	httpClientV4                       = util.NewSingleStackHTTPClient(time.Second*20, time.Second*5, time.Second*10, false)
+	httpClientV6                       = util.NewSingleStackHTTPClient(time.Second*20, time.Second*5, time.Second*10, true)
 
-type geoIP struct {
-	CountryCode  string `json:"country_code,omitempty"`
-	CountryCode2 string `json:"countryCode,omitempty"`
-	IP           string `json:"ip,omitempty"`
-	Query        string `json:"query,omitempty"`
-	Location     struct {
-		CountryCode string `json:"country_code,omitempty"`
-	} `json:"location,omitempty"`
-}
+	retryTimes      int
+	failedStartedAt time.Time
+	latestRetryAt   time.Time
+)
 
-func (ip *geoIP) Unmarshal(body []byte) error {
-	if err := util.Json.Unmarshal(body, ip); err != nil {
-		return err
+// UpdateIP 按设置时间间隔更新IP地址的缓存
+func FetchIP(useIPv6CountryCode bool) *pb.GeoIP {
+	logger.Println("正在更新本地缓存IP信息")
+
+	if retryTimes > 2 && time.Now().Before(latestRetryAt.Add(latestRetryAt.Sub(failedStartedAt)*time.Duration(2))) {
+		logger.Println("IP地址获取失败次数过多，fallback到agent连接IP")
+		return &pb.GeoIP{
+			Use6: false,
+			Ip: &pb.IP{
+				Ipv4: "",
+				Ipv6: "",
+			},
+		}
 	}
-	if ip.IP == "" && ip.Query != "" {
-		ip.IP = ip.Query
+
+	wg := new(sync.WaitGroup)
+	wg.Add(2)
+	var ipv4, ipv6 string
+	go func() {
+		defer wg.Done()
+		if len(CustomEndpoints) > 0 {
+			ipv4 = fetchIP(CustomEndpoints, false)
+		} else {
+			ipv4 = fetchIP(cfList, false)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if len(CustomEndpoints) > 0 {
+			ipv6 = fetchIP(CustomEndpoints, true)
+		} else {
+			ipv6 = fetchIP(cfList, true)
+		}
+	}()
+	wg.Wait()
+
+	if ipv6 != "" && (useIPv6CountryCode || ipv4 == "") {
+		GeoQueryIPChanged = GeoQueryIP != ipv6 || GeoQueryIPChanged
+		GeoQueryIP = ipv6
+	} else if ipv4 != "" {
+		GeoQueryIPChanged = GeoQueryIP != ipv4 || GeoQueryIPChanged
+		GeoQueryIP = ipv4
 	}
-	if ip.CountryCode == "" && ip.CountryCode2 != "" {
-		ip.CountryCode = ip.CountryCode2
+
+	if GeoQueryIP != "" {
+		retryTimes = 0
+		return &pb.GeoIP{
+			Use6: useIPv6CountryCode,
+			Ip: &pb.IP{
+				Ipv4: ipv4,
+				Ipv6: ipv6,
+			},
+		}
 	}
-	if ip.CountryCode == "" && ip.Location.CountryCode != "" {
-		ip.CountryCode = ip.Location.CountryCode
+
+	retryTimes++
+	now := time.Now()
+	latestRetryAt = now
+
+	if retryTimes == 1 {
+		failedStartedAt = now
 	}
+
 	return nil
 }
 
-var (
-	geoIPApiList = []string{
-		"http://api.myip.la/en?json",
-		"https://api.ip.sb/geoip",
-		"https://ipapi.co/json",
-		"http://ip-api.com/json/",
-		// "https://extreme-ip-lookup.com/json/", // 不精确
-		// "https://ip.seeip.org/geoip", // 不精确
-		// "https://freegeoip.app/json/", // 需要 Key
-	}
-	CachedIP, cachedCountry string
-	httpClientV4            = util.NewSingleStackHTTPClient(time.Second*20, time.Second*5, time.Second*10, false)
-	httpClientV6            = util.NewSingleStackHTTPClient(time.Second*20, time.Second*5, time.Second*10, true)
-)
-
-// UpdateIP 每30分钟更新一次IP地址与国家码的缓存
-func UpdateIP() {
-	for {
-		ipv4 := fetchGeoIP(geoIPApiList, false)
-		ipv6 := fetchGeoIP(geoIPApiList, true)
-		if ipv4.IP == "" && ipv6.IP == "" {
-			time.Sleep(time.Minute)
-			continue
-		}
-		if ipv4.IP == "" || ipv6.IP == "" {
-			CachedIP = fmt.Sprintf("%s%s", ipv4.IP, ipv6.IP)
-		} else {
-			CachedIP = fmt.Sprintf("%s/%s", ipv4.IP, ipv6.IP)
-		}
-		if ipv4.CountryCode != "" {
-			cachedCountry = ipv4.CountryCode
-		} else if ipv6.CountryCode != "" {
-			cachedCountry = ipv6.CountryCode
-		}
-		time.Sleep(time.Minute * 30)
-	}
-}
-
-func fetchGeoIP(servers []string, isV6 bool) geoIP {
-	var ip geoIP
+func fetchIP(servers []string, isV6 bool) string {
+	var ip string
 	var resp *http.Response
 	var err error
 
@@ -88,27 +109,41 @@ func fetchGeoIP(servers []string, isV6 bool) geoIP {
 		} else {
 			resp, err = httpGetWithUA(httpClientV4, servers[i])
 		}
+		// 遇到单栈机器提前退出
+		if err != nil && strings.Contains(err.Error(), "no route to host") {
+			return ip
+		}
 		if err == nil {
 			body, err := io.ReadAll(resp.Body)
 			if err != nil {
 				continue
 			}
 			resp.Body.Close()
-			if err := ip.Unmarshal(body); err != nil {
-				continue
+
+			bodyStr := string(body)
+			var newIP string
+
+			if !strings.Contains(bodyStr, "ip=") {
+				newIP = strings.TrimSpace(strings.ReplaceAll(bodyStr, "\n", ""))
+			} else {
+				lines := strings.Split(bodyStr, "\n")
+				for _, line := range lines {
+					if strings.HasPrefix(line, "ip=") {
+						newIP = strings.TrimPrefix(line, "ip=")
+						break
+					}
+				}
 			}
+			parsedIP := net.ParseIP(newIP)
 			// 没取到 v6 IP
-			if isV6 && !strings.Contains(ip.IP, ":") {
+			if isV6 && (parsedIP == nil || parsedIP.To4() != nil) {
 				continue
 			}
 			// 没取到 v4 IP
-			if !isV6 && !strings.Contains(ip.IP, ".") {
+			if !isV6 && (parsedIP == nil || parsedIP.To4() == nil) {
 				continue
 			}
-			// 未获取到国家码
-			if ip.CountryCode == "" {
-				continue
-			}
+			ip = newIP
 			return ip
 		}
 	}
@@ -120,6 +155,6 @@ func httpGetWithUA(client *http.Client, url string) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Add("User-Agent", MacOSChromeUA)
+	req.Header.Add("User-Agent", util.MacOSChromeUA)
 	return client.Do(req)
 }

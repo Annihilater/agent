@@ -5,8 +5,13 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"strings"
 	"time"
+)
+
+var (
+	DNSServersV4  = []string{"8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"}
+	DNSServersV6  = []string{"[2001:4860:4860::8888]:53", "[2001:4860:4860::8844]:53", "[2606:4700:4700::1111]:53", "[2606:4700:4700::1001]:53"}
+	DNSServersAll = append(DNSServersV4, DNSServersV6...)
 )
 
 func NewSingleStackHTTPClient(httpTimeout, dialTimeout, keepAliveTimeout time.Duration, ipv6 bool) *http.Client {
@@ -34,26 +39,29 @@ func NewSingleStackHTTPClient(httpTimeout, dialTimeout, keepAliveTimeout time.Du
 }
 
 func resolveIP(addr string, ipv6 bool) (string, error) {
-	url := strings.Split(addr, ":")
-
-	dnsServers := []string{"[2001:4860:4860::8844]", "[2400:3200::1]", "[2a10:50c0::1:ff]", "[2402:4e00::]"}
-	if !ipv6 {
-		dnsServers = []string{"8.8.4.4", "223.5.5.5", "94.140.14.140", "119.29.29.29"}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", err
 	}
 
-	res, err := net.LookupIP(url[0])
+	dnsServers := DNSServersV6
+	if !ipv6 {
+		dnsServers = DNSServersV4
+	}
+
+	res, err := LookupIP(host)
 	if err != nil {
-		for i := 0; i < len(dnsServers); i++ {
+		for _, server := range dnsServers {
 			r := &net.Resolver{
 				PreferGo: true,
 				Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 					d := net.Dialer{
 						Timeout: time.Second * 10,
 					}
-					return d.DialContext(ctx, "udp", dnsServers[i]+":53")
+					return d.DialContext(ctx, "udp", server)
 				},
 			}
-			res, err = r.LookupIP(context.Background(), "ip", url[0])
+			res, err = r.LookupIP(context.Background(), "ip", host)
 			if err == nil {
 				break
 			}
@@ -65,17 +73,18 @@ func resolveIP(addr string, ipv6 bool) (string, error) {
 	}
 
 	var ipv4Resolved, ipv6Resolved bool
+	var resolved string
 
-	for i := 0; i < len(res); i++ {
-		ip := res[i].String()
-		if strings.Contains(ip, ".") && !ipv6 {
-			ipv4Resolved = true
-			url[0] = ip
-			break
-		}
-		if strings.Contains(ip, ":") && ipv6 {
+	for _, r := range res {
+		if r.To4() != nil {
+			if !ipv6 {
+				ipv4Resolved = true
+				resolved = r.String()
+				break
+			}
+		} else if ipv6 {
 			ipv6Resolved = true
-			url[0] = "[" + ip + "]"
+			resolved = r.String()
 			break
 		}
 	}
@@ -88,5 +97,5 @@ func resolveIP(addr string, ipv6 bool) (string, error) {
 		return "", errors.New("the A record not resolved")
 	}
 
-	return strings.Join(url, ":"), nil
+	return net.JoinHostPort(resolved, port), nil
 }
